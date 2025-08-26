@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Ahmed ⇄ Xeo — Private Chat</title>
+  <link rel="stylesheet" href="./styles.css" />
+  <meta name="color-scheme" content="light dark">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">🕊️ Ahmed ⇄ Xeo</div>
+    <button id="signOutBtn" class="ghost" hidden>Sign out</button>
+  </header>
+
+  <main class="shell">
+    <!-- Auth -->
+    <section id="authPanel" class="panel">
+      <h1>Sign in</h1>
+      <form id="authForm" autocomplete="on">
+        <label>Email <input id="email" type="email" required /></label>
+        <label>Password <input id="password" type="password" required /></label>
+        <label>Display name <input id="displayName" type="text" required placeholder="Ahmed or Xeo" /></label>
+        <label>Room passphrase <small class="muted">(for encryption)</small>
+          <input id="passphrase" type="password" required placeholder="shared secret" />
+        </label>
+        <button class="primary" type="submit">Sign in</button>
+      </form>
+    </section>
+
+    <!-- Chat -->
+    <section id="chatPanel" class="panel" hidden>
+      <div class="roomHead">
+        <div>
+          <div class="roomTitle">Private Room</div>
+          <div class="roomSub" id="whoami"></div>
+        </div>
+        <button id="copyInvite" class="ghost">Copy invite link</button>
+      </div>
+      <div id="messages" class="messages" aria-live="polite"></div>
+      <form id="composer" class="composer" autocomplete="off">
+        <input id="messageInput" type="text" required maxlength="2000" placeholder="Type a message…" />
+        <button class="primary" type="submit">Send</button>
+      </form>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <small class="muted">Supabase Realtime • E2EE (AES-GCM) • Static GitHub Pages</small>
+  </footer>
+
+  <script type="module">
+    console.log("BOOT: page loaded");
+
+    // Supabase client via ESM CDN
+    import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+    // Local modules
+    import cfg from "./supabase-config.js";
+    import {
+      deriveKeyFromPassphrase, encryptText, decryptText,
+      bufToBase64, base64ToBuf, base64ToUint8
+    } from "./app.js";
+
+    // Init Supabase
+    const supabase = createClient(cfg.url, cfg.anonKey);
+    console.log("BOOT: supabase init", cfg.url);
+
+    // Elements
+    const $ = (id) => document.getElementById(id);
+    const authPanel = $("authPanel");
+    const chatPanel = $("chatPanel");
+    const whoami = $("whoami");
+    const copyInvite = $("copyInvite");
+    const messagesEl = $("messages");
+    const authForm = $("authForm");
+    const composer = $("composer");
+    const msgInput = $("messageInput");
+    const signOutBtn = $("signOutBtn");
+
+    const roomId = new URL(location.href).searchParams.get("room") || "ahmed-xeo";
+    let cryptoKey = null;
+
+    copyInvite.addEventListener("click", async () => {
+      const url = new URL(location.href);
+      url.searchParams.set("room", roomId);
+      await navigator.clipboard.writeText(url.toString());
+      copyInvite.textContent = "Copied";
+      setTimeout(() => (copyInvite.textContent = "Copy invite link"), 1200);
+    });
+
+    // Auth
+    authForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const email = $("email").value.trim();
+      const password = $("password").value;
+      const displayName = $("displayName").value.trim();
+      const passphrase = $("passphrase").value;
+
+      const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+      if (error) {
+        console.error(error);
+        alert("Sign-in failed: " + error.message);
+        return;
+      }
+      // derive E2EE key
+      cryptoKey = await deriveKeyFromPassphrase(passphrase, roomId);
+      whoami.textContent = `Signed in as: ${displayName || email}`;
+      authPanel.hidden = true;
+      chatPanel.hidden = false;
+      signOutBtn.hidden = false;
+
+      bootRoom();
+    });
+
+    signOutBtn.addEventListener("click", async () => {
+      await supabase.auth.signOut();
+      location.reload();
+    });
+
+    // Load existing + realtime subscribe
+    async function bootRoom() {
+      await loadExisting();
+      subscribeRealtime();
+    }
+
+    async function loadExisting() {
+      messagesEl.innerHTML = "";
+      const { data, error } = await supabase
+        .from("messages")
+        .select("*")
+        .eq("room", roomId)
+        .order("created_at", { ascending: true });
+      if (error) {
+        console.error(error);
+        alert("Load failed: " + error.message);
+        return;
+      }
+      data.forEach(renderRow);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    function subscribeRealtime() {
+      // Listen for new inserts for this room
+      supabase
+        .channel("room_" + roomId)
+        .on(
+          "postgres_changes",
+          { event: "INSERT", schema: "public", table: "messages", filter: `room=eq.${roomId}` },
+          (payload) => renderRow(payload.new, true)
+        )
+        .subscribe((status) => console.log("Realtime status:", status));
+    }
+
+    function renderRow(row, scroll = false) {
+      const me = supabase.auth.getUser().then(({ data }) => data?.user?.id).catch(() => null);
+      const wrap = document.createElement("div");
+      wrap.className = "bubbleRow";
+
+      // sender side for simple alignment
+      me.then((myId) => {
+        if (row.sender_id === myId) wrap.classList.add("me");
+      });
+
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      const when = new Date(row.created_at);
+      meta.textContent = `${row.sender_name} • ${when.toLocaleString()}`;
+
+      const bubble = document.createElement("div");
+      bubble.className = "bubble";
+
+      const body = document.createElement("div");
+      body.className = "body";
+      (async () => {
+        try {
+          const plaintext = await decryptText(
+            cryptoKey,
+            base64ToUint8(row.iv),
+            base64ToUint8(row.ciphertext)
+          );
+          body.textContent = plaintext;
+        } catch {
+          body.textContent = "🔒 Cannot decrypt (wrong passphrase?)";
+        }
+      })();
+
+      bubble.appendChild(body);
+      wrap.append(meta, bubble);
+      messagesEl.appendChild(wrap);
+      if (scroll) messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    // Send
+    composer.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const text = msgInput.value.trim();
+      if (!text) return;
+      if (!cryptoKey) return alert("Enter the room passphrase first.");
+
+      const { data: userData } = await supabase.auth.getUser();
+      const userId = userData?.user?.id;
+      const userEmail = userData?.user?.email || "Unknown";
+
+      const { iv, ciphertext } = await encryptText(cryptoKey, text);
+
+      const { error } = await supabase
+        .from("messages")
+        .insert({
+          room: roomId,
+          sender_id: userId,
+          sender_name: userEmail,
+          iv: base64ToBuf(bufToBase64(iv)),          // send as bytea
+          ciphertext: base64ToBuf(bufToBase64(ciphertext)), // send as bytea
+        });
+
+      if (error) {
+        console.error(error);
+        alert("Send failed: " + error.message);
+        return;
+      }
+      msgInput.value = "";
+    });
+  </script>
+</body>
+</html>
